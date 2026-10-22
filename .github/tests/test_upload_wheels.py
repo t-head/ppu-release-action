@@ -238,8 +238,9 @@ def test_upload_follows_rename_and_credentials_are_step_scoped(
     job = workflow["jobs"]["matrix-job"]
     steps = job["steps"]
     index = steps.index(repack_step)
-    assert steps[index - 2]["name"] == "编译"
-    assert steps[index - 1] is collect_step
+    assert steps[index - 3]["name"] == "编译"
+    assert steps[index - 2] is collect_step
+    assert steps[index - 1]["name"] == "保存收集的 wheel 产物"
     assert collect_step["shell"] == "bash"
     assert collect_step["env"] == {"PACKAGE_NAME": "${{ needs.prepare-matrix.outputs.package_name }}"}
     assert "if" not in collect_step
@@ -247,16 +248,16 @@ def test_upload_follows_rename_and_credentials_are_step_scoped(
     assert steps[index + 1] is rename_step
     assert steps[index + 2] is upload_step
     assert rename_step["shell"] == "bash"
-    assert "if" not in rename_step
+    assert rename_step["if"] == "${{ needs.prepare-matrix.outputs.should_release == 'true' }}"
     assert "continue-on-error" not in rename_step
     assert repack_step["uses"] == "docker://download.t-head.cn/docker_tool/manylinux_revpkg:04"
     assert repack_step["with"]["entrypoint"] == "/bin/bash"
-    assert "if" not in repack_step
+    assert repack_step["if"] == "${{ needs.prepare-matrix.outputs.should_release == 'true' }}"
     assert "continue-on-error" not in repack_step
     assert "${{" not in repack_step["with"]["args"]
     assert upload_step["name"] == "上传 wheel 到 Artifactory"
     assert upload_step["shell"] == "bash"
-    assert "if" not in upload_step
+    assert upload_step["if"] == "${{ needs.prepare-matrix.outputs.should_release == 'true' }}"
     assert "continue-on-error" not in upload_step
     assert job["env"]["RELEASE_VERSION"] == "${{ matrix.release_version }}"
     assert job["env"]["WHL_NAME"] == "${{ matrix.whl_name }}"
@@ -270,6 +271,56 @@ def test_upload_follows_rename_and_credentials_are_step_scoped(
         assert name not in job.get("env", {})
         assert name not in workflow.get("env", {})
         assert all(name not in step.get("env", {}) for step in job["steps"] if step is not upload_step)
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+@pytest.mark.parametrize("prepare", ["success", "failure", "skipped", "cancelled"])
+@pytest.mark.parametrize("release", ["true", "false", ""])
+@pytest.mark.parametrize("sdist", ["success", "failure", "skipped", "cancelled"])
+def test_matrix_gate_allows_nonrelease_without_sdist_but_requires_successful_preparation(
+    workflow, cancelled, prepare, release, sdist
+):
+    job = workflow["jobs"]["matrix-job"]
+    assert set(job["needs"]) == {"prepare-matrix", "build-sdist"}
+    condition = job["if"]
+    assert "!cancelled()" in condition
+    expression = condition.removeprefix("${{ ").removesuffix(" }}")
+    for key, value in {
+        "!cancelled()": repr(not cancelled),
+        "needs.prepare-matrix.result": repr(prepare),
+        "needs.prepare-matrix.outputs.should_release": repr(release),
+        "needs.build-sdist.result": repr(sdist),
+    }.items():
+        expression = expression.replace(key, value)
+    expected = not cancelled and prepare == "success" and (
+        (release == "false" and sdist == "skipped") or (release == "true" and sdist == "success")
+    )
+    assert eval(expression.replace("&&", "and").replace("||", "or"), {"__builtins__": {}}) is expected
+
+
+def test_collected_artifact_precedes_all_release_only_steps(workflow, collect_step):
+    steps = workflow["jobs"]["matrix-job"]["steps"]
+    index = steps.index(collect_step) + 1
+    artifact = steps[index]
+    assert artifact["name"] == "保存收集的 wheel 产物"
+    assert artifact["uses"] == "actions/upload-artifact@v4"
+    assert artifact["with"] == {
+        "name": "${{ needs.prepare-matrix.outputs.package_name }}-collected-wheels-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}",
+        "path": "dist/*.whl", "if-no-files-found": "error", "compression-level": "0",
+        "include-hidden-files": "true",
+    }
+    for step in steps[:index + 1]:
+        assert "if" not in step
+        assert "continue-on-error" not in step
+        assert "secrets." not in str(step)
+    release_gate = "needs.prepare-matrix.outputs.should_release == 'true'"
+    for step in steps[index + 1:]:
+        if step["name"] == "保存 GitHub Release wheel 产物":
+            assert step["if"] == "${{ " + release_gate + " && (inputs.tag_version != '' || github.ref_type == 'tag') }}"
+        else:
+            assert step["if"] == "${{ " + release_gate + " }}"
+        # 不使用 always() 等状态函数，保留默认 success()，防止前序失败后继续发布。
+        assert "continue-on-error" not in step
 
 
 def test_upload_shell_syntax(upload_step):
@@ -438,12 +489,17 @@ def test_rename_wheel_without_changing_bytes(run_rename, workspace):
 
 
 def test_repacked_wheel_is_uploaded_under_release_version(
-    run_build, run_collect, run_repack, run_rename, run_upload, workspace
+    workflow, run_build, run_collect, run_repack, run_rename, run_upload, workspace
 ):
     result = run_build()
     assert result.returncode == 0, result.stderr
     result = run_collect()
     assert result.returncode == 0, result.stderr
+    artifact = next(step for step in workflow["jobs"]["matrix-job"]["steps"]
+                    if step["name"] == "保存收集的 wheel 产物")
+    # 模拟 Actions 上传时读取文件，随后 Repack 不影响已保存的原始字节。
+    saved = {path.name: path.read_bytes() for path in workspace.glob(artifact["with"]["path"])}
+    assert saved == {WHEEL_NAME: b"test wheel data"}
     result, _ = run_repack()
     assert result.returncode == 0, result.stderr
     assert (workspace / "dist" / WHEEL_NAME).read_bytes() == b"repacked wheel data"
@@ -458,6 +514,94 @@ def test_repacked_wheel_is_uploaded_under_release_version(
     assert args[-1] == ARTIFACTORY_URL + "demo_package/" + quote(RELEASE_VERSION, safe="") + "/" + quote(RENAMED_WHEEL, safe="")
     assert (workspace / "dist" / RENAMED_WHEEL).read_bytes() == b"repacked wheel data"
     assert [path.name for path in (workspace / "dist").glob("*.whl")] == [RENAMED_WHEEL]
+    assert saved == {WHEEL_NAME: b"test wheel data"}
+
+
+@pytest.mark.parametrize("ref_type,ref_name,override", [
+    ("tag", "1.2.3RC1", ""),
+    ("branch", "main", ""),
+    ("tag", "9.9.9", "V1.2.3rc1"),
+])
+@pytest.mark.parametrize("failure", [None, "build", "collect"])
+def test_nonrelease_matrix_build_stops_after_original_wheel_artifact(
+    workflow, workspace, run_build, run_collect, ref_type, ref_name, override, failure
+):
+    inputs = {
+        "package_name": "demo_package", "python_versions": '["312"]',
+        "os_versions": '["ubuntu2404"]', "runtime_versions": '["3"]',
+        "torch_versions": '["2.13.0"]', "sdk_versions": '["2.2.0"]', "tag_version": override,
+    }
+    output = workspace / "matrix-output"
+    env = dict(os.environ, INPUTS_JSON=json.dumps(inputs), GITHUB_OUTPUT=str(output),
+               GITHUB_REF_TYPE=ref_type, GITHUB_REF_NAME=ref_name, SOURCE_DIR=str(workspace),
+               PYTHONDONTWRITEBYTECODE="1")
+    if ref_type == "branch":
+        git_env = {key: value for key, value in env.items() if not key.startswith("GIT_")}
+        git_env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                       GIT_AUTHOR_NAME="CI Test", GIT_AUTHOR_EMAIL="ci@example.invalid",
+                       GIT_COMMITTER_NAME="CI Test", GIT_COMMITTER_EMAIL="ci@example.invalid")
+        for args in (("init", "--quiet"), ("commit", "--allow-empty", "--quiet", "-m", "test")):
+            result = subprocess.run(["git", "-C", str(workspace), *args], env=git_env,
+                                    text=True, capture_output=True, timeout=30)
+            assert result.returncode == 0, result.stderr
+    result = subprocess.run([sys.executable, str(CI_ROOT / "scripts/prepare_matrix.py")],
+                            cwd=workspace, env=env, text=True, capture_output=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    outputs = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    assert outputs["should_release"] == "false"
+    entry, = json.loads(outputs["matrix"])["include"]
+    assert entry["image"]
+    assert entry["release_version"] == entry["whl_name"] == ""
+
+    def allows(condition):
+        expression = condition.removeprefix("${{ ").removesuffix(" }}")
+        for key, value in {
+            "!cancelled()": "True", "needs.prepare-matrix.result": repr("success"),
+            "needs.prepare-matrix.outputs.should_release": repr(outputs["should_release"]),
+            "needs.build-sdist.result": repr("skipped"), "needs.matrix-job.result": repr("success"),
+            "needs.publish-sdist.result": repr("skipped"), "needs.publish-sdist.outputs.published": repr(""),
+            "needs.update-metadata.result": repr("skipped"),
+            "inputs.tag_version": repr(override), "github.ref_type": repr(ref_type),
+        }.items():
+            expression = expression.replace(key, value)
+        return eval(expression.replace("&&", "and").replace("||", "or"), {"__builtins__": {}})
+
+    jobs = workflow["jobs"]
+    assert allows(jobs["matrix-job"]["if"])
+    for job_id in ("build-sdist", "publish-sdist", "update-metadata", "post-release-data"):
+        assert not allows(jobs[job_id]["if"])
+    (workspace / "build output").mkdir()
+    command = f"printf 'test wheel data' > {shlex.quote('build output/' + WHEEL_NAME)}"
+    if failure == "build":
+        command += "\nexit 7"
+    elif failure == "collect":
+        command += "\nprintf 'duplicate' > dist/demo_package-other.whl"
+    executed, artifacts = [], {}
+    successful = True
+    steps = jobs["matrix-job"]["steps"]
+    start = next(i for i, step in enumerate(steps) if step["name"] == "编译")
+    for step in steps[start:]:
+        # 模拟默认 success() 与 YAML if；编译和收集执行真实脚本，仅 artifact 上传使用内存快照。
+        if not successful or not allows(step.get("if", "True")):
+            continue
+        executed.append(step["name"])
+        if step["name"] == "编译":
+            result = run_build(build_command=command, RELEASE_VERSION=entry["release_version"])
+            successful = result.returncode == 0
+        elif step["name"] == "收集 wheel 到 dist":
+            result = run_collect()
+            successful = result.returncode == 0
+        elif step["name"] == "保存收集的 wheel 产物":
+            artifacts = {path.name: path.read_bytes() for path in workspace.glob(step["with"]["path"])}
+        else:
+            pytest.fail(f"非发布构建不应执行：{step['name']}")
+    expected = ["编译", "收集 wheel 到 dist", "保存收集的 wheel 产物"]
+    assert executed == (expected if failure is None else expected[:1 if failure == "build" else 2])
+    assert artifacts == ({WHEEL_NAME: b"test wheel data"} if failure is None else {})
+    assert not (workspace / "release-data").exists()
+    assert not (workspace / "matrix-success.txt").exists()
+    if failure is None:
+        assert (workspace / "dist" / WHEEL_NAME).read_bytes() == b"test wheel data"
 
 
 @pytest.mark.parametrize("torch_version", ["2.10.0", "2.13.0"])

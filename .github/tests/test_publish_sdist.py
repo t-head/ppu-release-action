@@ -130,7 +130,7 @@ def test_markers_only_follow_successful_wheel_upload(workflow, workspace, run_st
     assert create["name"] == "记录矩阵任务成功"
     assert save["uses"] == "actions/upload-artifact@v4"
     for step in (create, save):
-        assert "if" not in step
+        assert step["if"] == "${{ needs.prepare-matrix.outputs.should_release == 'true' }}"
         assert "continue-on-error" not in step
     result = run_step(create, RUNNER_TEMP=str(workspace))
     assert result.returncode == 0, result.stderr

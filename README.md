@@ -11,11 +11,13 @@ Entry point: [`.github/workflows/matrix-release.yml`](.github/workflows/matrix-r
 ```text
 Validate the package name, release version, and image mappings
   → Build bootstrap source distributions (deduplicated by release_version)
-  → Matrix build → Collect wheels → Repack → Rename → Upload wheels
+  → Matrix build → Collect wheels → Save original wheel artifact → Repack → Rename → Upload wheels
   → Publish source distributions after at least one matrix job succeeds
   → Update the package's index.json
   → Submit release data for the current run
 ```
+
+非发布路径（`should_release=false`）：跳过源码包构建，仅执行矩阵编译 → 收集 wheel → 保存原始 wheel artifact，然后结束。
 
 - `prepare-matrix`: Normalizes the package name, applies version gates, and generates up to 32 matrix jobs.
 - `build-sdist`: Generates `.tar.gz` files using this repository's `setup.py` template. These bootstrap packages match and download prebuilt wheels; they are **not archives of the caller's complete source code**.
@@ -156,7 +158,7 @@ The release version is selected in the following order of precedence:
 2. `github.ref_name` for tag-triggered runs.
 3. For other triggers, only tags on the caller's current commit are checked. The first correctly formatted version without `rc` is selected in descending Git version order; historical commits are not searched.
 
-For all sources, a single leading `v` / `V` is removed, while internal content such as `+v0.3.0` is preserved. All builds and publishing are skipped if the explicit version or triggering tag contains `rc` (case-insensitive), or if the current commit has no qualifying tag.
+所有版本来源均去除开头的一个 `v` / `V`，保留 `+v0.3.0` 等内部内容。指定版本或触发 tag 含 `rc`（忽略大小写），或当前提交没有合格 tag 时，`should_release=false`：仍校验构建参数和镜像映射，生成矩阵并编译、收集 wheel、保存 Actions artifact；不构建源码包，不执行 Repack、重命名及任何后续发布任务。此时 `RELEASE_VERSION` 和 `WHL_NAME` 为空，wheel 版本与文件名由调用方的构建命令决定。
 
 `tag_version` only determines the release version, artifact paths, and release data; it does not check out source code from the tag with that name. Manual runs build the triggering revision of the selected branch / ref.
 
@@ -192,7 +194,9 @@ The caller's code is checked out with its full Git history and recursive submodu
 
 These addresses are currently hardcoded in the workflow or scripts, rather than exposed as configurable inputs. Ensure upload paths do not conflict across matrix combinations.
 
-GitHub Actions artifacts also retain source distributions, release data JSON files, and matrix success markers. An additional wheel artifact is saved only for tag-triggered runs or when `tag_version` is explicitly provided. A branch run whose current commit has a tag does not save this wheel artifact unless the version is explicitly overridden.
+每个矩阵任务在成功收集 wheel 后都会保存原始包到 GitHub Actions artifacts，名称为 `{package_name}-collected-wheels-{run_id}-{run_attempt}-{job-index}`，按包名、运行、重试及矩阵索引隔离。保存发生在 Repack 和重命名之前，保留原始文件名与内容；仅上传 `dist/*.whl`，构建或收集失败时不上传。
+
+发布流程还会保存源码包、发布数据 JSON 和成功标记。仅在 `should_release=true` 且由 tag 触发或显式指定 `tag_version` 时，额外保存重打包后的 `release-wheels` artifact。非发布构建仅保存上述原始 wheel artifact。
 
 **The workflow currently does not create GitHub Releases or upload Release attachments.** The "Save GitHub Release wheel artifacts" step actually uses `actions/upload-artifact`.
 

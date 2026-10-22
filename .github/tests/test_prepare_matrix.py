@@ -91,13 +91,13 @@ def run_matrix(script, output_file, monkeypatch):
         written = "".join(call.args[0] for call in output_file().write.call_args_list)
         assert written.endswith("\n")
         values = dict(line.split("=", 1) for line in written.splitlines())
-        if values.get("should_release") == "false":
-            assert values == {"should_release": "false"}
-            return []
         assert set(values) == {"matrix", "should_release"}
-        assert values["should_release"] == "true"
+        assert values["should_release"] in ("true", "false")
         matrix = json.loads(values["matrix"])
         assert set(matrix) == {"include"}
+        assert matrix["include"]
+        for entry in matrix["include"]:
+            assert bool(entry["release_version"]) == (values["should_release"] == "true")
         return matrix["include"]
 
     return run
@@ -415,26 +415,62 @@ def test_trigger_tag_normalized_and_wheel_uses_public_version(
     "1.0.0rc1", "1.0.0RC1", "v1.2.3Rc2", "V1.2.3RC2", "1.0.0rC1+v0.3.0",
     "1.0.0+rc1", "1.0.0+V0.3.0.RC", "1.0.0+source",
 ])
-def test_rc_tags_skip_before_matrix_input_and_image_validation(script, run_matrix, monkeypatch, capsys, tag):
+def test_rc_tags_generate_build_matrix_without_release_fields(script, run_matrix, monkeypatch, capsys, tag):
     monkeypatch.setenv("GITHUB_REF_NAME", tag)
-    monkeypatch.setattr(script, "IMAGES_MAP", {})
     runner = create_autospec(script.subprocess.run)
     monkeypatch.setattr(script.subprocess, "run", runner)
-    assert run_matrix(inputs={"python_versions": "["}) == []
-    assert "跳过全部构建和发布" in capsys.readouterr().out
+    entries = run_matrix(dict(DEFAULT_INPUTS, torch_versions='["", "2.8.0"]'))
+    assert len(entries) == 2
+    for entry in entries:
+        assert entry["image"] == script.IMAGES_MAP[image_key(entry)]
+        assert entry["tag"] == entry["release_version"] == entry["whl_name"] == ""
+    assert "仅构建 wheel 并保存 Actions artifact，不发布" in capsys.readouterr().out
     runner.assert_not_called()
 
 
-def test_rc_script_entrypoint_exits_successfully_without_matrix(monkeypatch):
+@pytest.mark.parametrize("source", ["tag", "override", "branch"])
+@pytest.mark.parametrize("invalid,error", [
+    ({"python_versions": "["}, "python_versions 必须是合法 JSON"),
+    ({"sdk_versions": "[]"}, "sdk_versions 必须是非空 JSON 数组"),
+    ({"package_name": "../pkg"}, "package_name 必须是合法的 Python 包名"),
+    ({"python_versions": '["38"]'}, "缺少 ubuntu2204-py38"),
+])
+def test_nonrelease_builds_still_validate_inputs_and_images(
+    script, run_matrix, monkeypatch, output_file, source, invalid, error
+):
+    inputs = dict(DEFAULT_INPUTS, **invalid)
+    if source == "tag":
+        monkeypatch.setenv("GITHUB_REF_NAME", "1.0.0RC1")
+    elif source == "override":
+        inputs["tag_version"] = "1.0.0rc1"
+    else:
+        monkeypatch.setenv("GITHUB_REF_TYPE", "branch")
+        monkeypatch.setenv("SOURCE_DIR", "caller-source")
+        monkeypatch.setattr(script.subprocess, "run", create_autospec(
+            script.subprocess.run, return_value=subprocess.CompletedProcess([], 0, stdout="")
+        ))
+    with pytest.raises(SystemExit, match=error):
+        run_matrix(inputs)
+    output_file.assert_not_called()
+
+
+def test_rc_script_entrypoint_outputs_build_matrix(monkeypatch):
     with tempfile.TemporaryDirectory(prefix=".matrix-skip-test-", dir=SCRIPT_PATH.parents[1]) as directory:
         output = Path(directory) / "github-output"
+        inputs = dict(DEFAULT_INPUTS, package_name="demo_package", python_versions='[312]',
+                      os_versions='["ubuntu2404"]', torch_versions='["2.13.0", "2.10.0"]',
+                      sdk_versions='["2.2.0"]')
         env = dict(os.environ, GITHUB_REF_TYPE="tag", GITHUB_REF_NAME="1.2.3RC1",
-                   GITHUB_OUTPUT=str(output), INPUTS_JSON="{}", PYTHONDONTWRITEBYTECODE="1")
+                   GITHUB_OUTPUT=str(output), INPUTS_JSON=json.dumps(inputs), PYTHONDONTWRITEBYTECODE="1")
         result = subprocess.run([sys.executable, str(SCRIPT_PATH)], env=env,
                                 text=True, capture_output=True, timeout=30)
         assert result.returncode == 0, result.stderr
-        assert output.read_text() == "should_release=false\n"
-        assert "跳过全部构建和发布" in result.stdout
+        values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+        assert values["should_release"] == "false"
+        entries = json.loads(values["matrix"])["include"]
+        assert len(entries) == 2
+        assert all(entry["image"] and entry["release_version"] == "" for entry in entries)
+        assert "仅构建 wheel 并保存 Actions artifact，不发布" in result.stdout
 
 
 @pytest.mark.parametrize("ref_type,ref_name", [
@@ -488,13 +524,14 @@ def test_invalid_tag_version_fails_without_falling_back_or_writing_output(
 
 @pytest.mark.parametrize("tag_version", ["1.0.0rc1", "1.0.0RC1", "v2.0.0Rc2", "V2.0.0RC2", "1.0.0+source"])
 @pytest.mark.parametrize("ref_type", ["tag", "branch"])
-def test_rc_override_skips_before_matrix_validation(script, run_matrix, monkeypatch, ref_type, tag_version):
+def test_rc_override_builds_without_releasing_or_reading_repository(script, run_matrix, monkeypatch, ref_type, tag_version):
     monkeypatch.setenv("GITHUB_REF_TYPE", ref_type)
     monkeypatch.setenv("GITHUB_REF_NAME", "9.9.9")
-    monkeypatch.setattr(script, "IMAGES_MAP", {})
     runner = create_autospec(script.subprocess.run)
     monkeypatch.setattr(script.subprocess, "run", runner)
-    assert run_matrix(inputs={"tag_version": tag_version, "python_versions": "["}) == []
+    entry = run_matrix(dict(DEFAULT_INPUTS, tag_version=tag_version))[0]
+    assert entry["image"] == script.IMAGES_MAP[image_key(entry)]
+    assert entry["tag"] == entry["release_version"] == entry["whl_name"] == ""
     runner.assert_not_called()
 
 
@@ -639,7 +676,7 @@ def test_branch_uses_only_current_commit_tag(
     ["vv1.0.0"], ["VV1.0.0"], ["vV1.0.0"], ["Vv1.0.0"],
     ["1.1.0Rc1", "1.2.0rC1", "other-tag"],
 ])
-def test_branch_without_eligible_head_tag_skips_even_with_history(
+def test_branch_without_eligible_head_tag_builds_without_historical_release(
     run_matrix, monkeypatch, caller_git_repository, current_tags, capsys
 ):
     directory, git = caller_git_repository
@@ -649,15 +686,18 @@ def test_branch_without_eligible_head_tag_skips_even_with_history(
         git("tag", tag)
     monkeypatch.setenv("SOURCE_DIR", directory)
     monkeypatch.setenv("GITHUB_REF_TYPE", "branch")
-    assert run_matrix(inputs={"python_versions": "["}) == []
-    assert "跳过全部构建和发布" in capsys.readouterr().out
+    entries = run_matrix()
+    assert len(entries) == 1
+    assert entries[0]["tag"] == entries[0]["release_version"] == entries[0]["whl_name"] == ""
+    assert "仅构建 wheel 并保存 Actions artifact，不发布" in capsys.readouterr().out
 
 
-def test_branch_without_any_tags_skips(run_matrix, monkeypatch, caller_git_repository):
+def test_branch_without_any_tags_builds_without_release(run_matrix, monkeypatch, caller_git_repository):
     directory, _ = caller_git_repository
     monkeypatch.setenv("SOURCE_DIR", directory)
     monkeypatch.setenv("GITHUB_REF_TYPE", "branch")
-    assert run_matrix() == []
+    entry = run_matrix()[0]
+    assert entry["tag"] == entry["release_version"] == entry["whl_name"] == ""
 
 
 @pytest.mark.parametrize("annotated", [False, True])
@@ -688,7 +728,8 @@ def test_rc_trigger_does_not_use_other_stable_tag_on_same_commit(
     git("tag", "1.1.0RC1")
     monkeypatch.setenv("SOURCE_DIR", directory)
     monkeypatch.setenv("GITHUB_REF_NAME", "1.1.0RC1")
-    assert run_matrix() == []
+    entry = run_matrix()[0]
+    assert entry["tag"] == entry["release_version"] == entry["whl_name"] == ""
 
 
 @pytest.mark.parametrize("prefix", ["v", "V"])
@@ -814,7 +855,7 @@ def test_workflow_uses_caller_history_and_exposes_generated_fields():
     for job_id in ("build-sdist", "matrix-job", "publish-sdist", "update-metadata", "post-release-data"):
         job = workflow["jobs"][job_id]
         assert "needs.prepare-matrix.outputs.should_release == 'true'" in job["if"]
-        if job_id in ("build-sdist", "matrix-job"):
+        if job_id == "build-sdist":
             assert job["if"] == "${{ needs.prepare-matrix.outputs.should_release == 'true' }}"
         needs = job["needs"] if isinstance(job["needs"], list) else [job["needs"]]
         assert "prepare-matrix" in needs

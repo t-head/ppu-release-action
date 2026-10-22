@@ -54,7 +54,7 @@ on:
         required: true
         type: string
       tag_version:
-        description: '可选发布版本，优先于仓库 tag，例如 1.0.0 或 V1.0.0+v0.3.0；所有版本来源均去除开头的 v/V，内部内容不变；须符合 PEP 440 及现有 tag 格式，非法值报错，含 rc（忽略大小写）仍跳过；不改变代码检出版本'
+        description: '可选发布版本，优先于仓库 tag，例如 1.0.0 或 V1.0.0+v0.3.0；所有版本来源均去除开头的 v/V，内部内容不变；须符合 PEP 440 及现有 tag 格式，非法值报错，含 rc（忽略大小写）时仅构建 wheel 并保存 artifact，不发布；不改变代码检出版本'
         required: false
         type: string
         default: ''
@@ -264,7 +264,8 @@ jobs:
     name: py${{ matrix.python_version }} / ${{ matrix.os_version }} / runtime${{ matrix.runtime_version }} / torch${{ matrix.torch_version }} / sdk${{ matrix.sdk_version }}
     needs: [prepare-matrix, build-sdist]
     # job 条件先于矩阵展开，跳过时不解析空的 matrix output，也不启动编译容器。
-    if: ${{ needs.prepare-matrix.outputs.should_release == 'true' }}
+    # 非发布构建允许源码包任务跳过；发布构建仍须等待源码包成功。
+    if: ${{ !cancelled() && needs.prepare-matrix.result == 'success' && ((needs.prepare-matrix.outputs.should_release == 'false' && needs.build-sdist.result == 'skipped') || (needs.prepare-matrix.outputs.should_release == 'true' && needs.build-sdist.result == 'success')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 360
     strategy:
@@ -406,8 +407,18 @@ jobs:
           print("已收集 wheel：" + json.dumps(str(target.relative_to(root)), ensure_ascii=False))
           PY
 
+      - name: 保存收集的 wheel 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ needs.prepare-matrix.outputs.package_name }}-collected-wheels-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
+          path: dist/*.whl
+          if-no-files-found: error
+          compression-level: 0
+          include-hidden-files: true
+
       # Docker action 与编译容器共享工作区，在指定工具镜像内完成重打包。
       - name: Repack wheel
+        if: ${{ needs.prepare-matrix.outputs.should_release == 'true' }}
         uses: docker://download.t-head.cn/docker_tool/manylinux_revpkg:04
         with:
           entrypoint: /bin/bash
@@ -453,6 +464,7 @@ jobs:
             "
 
       - name: 重命名 wheel
+        if: ${{ needs.prepare-matrix.outputs.should_release == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -484,6 +496,7 @@ jobs:
           printf 'wheel 产物：%s\n' "$target"
 
       - name: 上传 wheel 到 Artifactory
+        if: ${{ needs.prepare-matrix.outputs.should_release == 'true' }}
         shell: bash
         env:
           ARTIFACTORY_URL: https://download.t-head.cn/artifactory/pypi_generic/
@@ -564,7 +577,7 @@ jobs:
 
       - name: 保存 GitHub Release wheel 产物
         # 指定版本已通过矩阵校验和 rc 门禁，分支触发时也保存发布产物。
-        if: ${{ inputs.tag_version != '' || github.ref_type == 'tag' }}
+        if: ${{ needs.prepare-matrix.outputs.should_release == 'true' && (inputs.tag_version != '' || github.ref_type == 'tag') }}
         uses: actions/upload-artifact@v4
         with:
           name: ${{ needs.prepare-matrix.outputs.package_name }}-release-wheels-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
@@ -573,6 +586,7 @@ jobs:
           compression-level: 0
 
       - name: 生成发布数据 JSON
+        if: ${{ needs.prepare-matrix.outputs.should_release == 'true' }}
         shell: bash
         env:
           PACKAGE_NAME: ${{ needs.prepare-matrix.outputs.package_name }}
@@ -610,6 +624,7 @@ jobs:
           PY
 
       - name: 保存发布数据 JSON
+        if: ${{ needs.prepare-matrix.outputs.should_release == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: ${{ needs.prepare-matrix.outputs.package_name }}-release-data-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
@@ -617,10 +632,12 @@ jobs:
           if-no-files-found: error
 
       - name: 记录矩阵任务成功
+        if: ${{ needs.prepare-matrix.outputs.should_release == 'true' }}
         shell: bash
         run: printf 'success\n' > "$RUNNER_TEMP/matrix-success.txt"
 
       - name: 保存矩阵任务成功标记
+        if: ${{ needs.prepare-matrix.outputs.should_release == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: ${{ needs.prepare-matrix.outputs.package_name }}-matrix-success-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}

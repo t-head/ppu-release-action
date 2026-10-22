@@ -87,11 +87,9 @@ def main():
     if not isinstance(inputs, dict):
         fail("触发参数 必须是 JSON 对象")
     tag = get_build_tag(inputs.get("tag_version", ""))
-    if tag is None:
-        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-            output.write("should_release=false\n")
-        print("tag 包含 rc（忽略大小写），或当前提交没有合格版本 tag，跳过全部构建和发布")
-        return
+    should_release = tag is not None
+    if not should_release:
+        print("tag 包含 rc（忽略大小写），或当前提交没有合格版本 tag，仅构建 wheel 并保存 Actions artifact，不发布")
 
     package_name = inputs.get("package_name", "")
     if not isinstance(package_name, str) or not re.fullmatch(
@@ -138,23 +136,26 @@ def main():
             fail(f"BUILD_CONTAINER_IMAGES 缺少 {key} 或镜像地址为空/包含空白字符")
 
     # tag 已统一去除 v/V 前缀；release 保留本地版本，wheel 只取 + 前的版本。
-    wheel_version = tag.split("+", 1)[0]
+    wheel_version = tag.split("+", 1)[0] if should_release else ""
     combinations = []
     for values in itertools.product(*axes.values()):
         entry = dict(zip(axes, values))
         key = f"{entry['os_version']}-py{entry['python_version']}-sdk{entry['sdk_version']}-hggcrt{entry['runtime_version']}-torch{entry['torch_version']}"
         entry["image"] = IMAGES_MAP.get(key)
-        # 记录最终版本（指定的 tag_version 或仓库 tag），供发布数据汇总使用。
-        entry["tag"] = tag
-        entry["release_version"] = f"{tag}.sail{entry['sdk_version']}"
-        if "+" not in tag:
-            entry["release_version"] = f"{tag}+sail{entry['sdk_version']}"
-        torch_suffix = f"torch{entry['torch_version']}" if entry["torch_version"] else ""
-        python_tag = f"cp{entry['python_version']}"
-        entry["whl_name"] = (
-            f"{wheel_package_name}-{wheel_version}+hggcrt{entry['runtime_version']}"
-            f"{torch_suffix}{entry['os_version']}oe-{python_tag}-{python_tag}-linux_x86_64.whl"
-        )
+        # 非发布构建不生成发布版本和目标文件名，保留构建命令产出的原始 wheel。
+        entry.update(tag="", release_version="", whl_name="")
+        if should_release:
+            # 记录最终版本（指定的 tag_version 或仓库 tag），供发布数据汇总使用。
+            entry["tag"] = tag
+            entry["release_version"] = f"{tag}.sail{entry['sdk_version']}"
+            if "+" not in tag:
+                entry["release_version"] = f"{tag}+sail{entry['sdk_version']}"
+            torch_suffix = f"torch{entry['torch_version']}" if entry["torch_version"] else ""
+            python_tag = f"cp{entry['python_version']}"
+            entry["whl_name"] = (
+                f"{wheel_package_name}-{wheel_version}+hggcrt{entry['runtime_version']}"
+                f"{torch_suffix}{entry['os_version']}oe-{python_tag}-{python_tag}-linux_x86_64.whl"
+            )
         # entry["torch_url"] = get_torch_url(
         #     python_version=entry["python_version"],
         #     os_version=entry["os_version"],
@@ -172,7 +173,7 @@ def main():
     matrix = json.dumps({"include": combinations}, separators=(",", ":"))
     with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
         output.write(f"matrix={matrix}\n")
-        output.write("should_release=true\n")
+        output.write(f"should_release={str(should_release).lower()}\n")
     print(f"已生成 {count} 个矩阵任务")
 
 

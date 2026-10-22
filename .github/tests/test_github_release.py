@@ -46,7 +46,10 @@ def test_tag_artifact_follows_upload_and_precedes_success_marker(workflow, wheel
     assert [step["name"] for step in steps[index + 1:]] == [
         "生成发布数据 JSON", "保存发布数据 JSON", "记录矩阵任务成功", "保存矩阵任务成功标记",
     ]
-    assert wheel_artifact["if"] == "${{ inputs.tag_version != '' || github.ref_type == 'tag' }}"
+    assert wheel_artifact["if"] == (
+        "${{ needs.prepare-matrix.outputs.should_release == 'true' && "
+        "(inputs.tag_version != '' || github.ref_type == 'tag') }}"
+    )
     assert wheel_artifact["uses"] == "actions/upload-artifact@v4"
     assert wheel_artifact["with"]["path"] == "dist/*.whl"
     assert wheel_artifact["with"]["if-no-files-found"] == "error"
@@ -59,11 +62,13 @@ def test_tag_artifact_follows_upload_and_precedes_success_marker(workflow, wheel
     ("", "tag", True), ("", "branch", False),
     ("2.4.0", "branch", True), ("v2.4.0+v0.5.0", "tag", True),
 ])
-def test_wheel_artifact_accepts_validated_override(wheel_artifact, tag_version, ref_type, expected):
+@pytest.mark.parametrize("should_release", ["true", "false"])
+def test_wheel_artifact_accepts_validated_override(wheel_artifact, tag_version, ref_type, expected, should_release):
     expression = wheel_artifact["if"].removeprefix("${{ ").removesuffix(" }}")
     expression = expression.replace("inputs.tag_version", repr(tag_version))
-    expression = expression.replace("github.ref_type", repr(ref_type)).replace("||", "or")
-    assert eval(expression, {"__builtins__": {}}) is expected
+    expression = expression.replace("needs.prepare-matrix.outputs.should_release", repr(should_release))
+    expression = expression.replace("github.ref_type", repr(ref_type)).replace("||", "or").replace("&&", "and")
+    assert eval(expression, {"__builtins__": {}}) is (expected and should_release == "true")
 
 
 @pytest.mark.parametrize("field,other", [
@@ -72,6 +77,7 @@ def test_wheel_artifact_accepts_validated_override(wheel_artifact, tag_version, 
     ("github.run_attempt", "1"),
 ])
 @pytest.mark.parametrize("step_name,label", [
+    ("保存收集的 wheel 产物", "collected-wheels"),
     ("保存 GitHub Release wheel 产物", "release-wheels"),
     ("保存发布数据 JSON", "release-data"),
 ])
@@ -110,7 +116,7 @@ def test_release_data_is_saved_after_publication_without_tag_only_gate(workflow)
     assert save["with"]["if-no-files-found"] == "error"
     for step in (generate, save):
         # 默认 success() 保证编译或上传失败时跳过；合格分支与 tag 均可保存。
-        assert "if" not in step
+        assert step["if"] == "${{ needs.prepare-matrix.outputs.should_release == 'true' }}"
         assert "continue-on-error" not in step
         assert "secrets." not in str(step)
     assert "github.ref_name" not in str(generate)
